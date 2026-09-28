@@ -1,0 +1,48 @@
+{
+  "Film": {
+    "params": {
+      "SMOOTHING_FACTOR": 0.6,
+      "SNAP_THRESHOLD": 200,
+      "TARGET_FPS": 60
+    },
+    "salvato": "2026-07-26 21:16"
+  },
+  "Gaming": {
+    "params": {
+      "SMOOTHING_FACTOR": 0.15,
+      "SNAP_THRESHOLD": 120,
+      "TARGET_FPS": 240
+    },
+    "salvato": "2026-07-26 21:16"
+  },
+  "preset_base_2": {
+    "params": {
+      "SAMPLE_DEPTH_RATIO": 0.22,
+      "SAMPLE_OFFSET_RATIO": 0.08,
+      "GAMMA": 1.6,
+      "SATURATION_BOOST": 1.1,
+      "SOGLIA_MINIMA": 10,
+      "SMOOTHING_FACTOR": 0.6,
+      "SNAP_THRESHOLD": 190,
+      "TARGET_FPS": 144,
+      "COLOR_MATRIX": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    },
+    "salvato": "2026-07-26 22:59"
+  }
+}
