@@ -1,5 +1,5 @@
 # =============================================================================
-# main.py - Controller principale Ambient Light ESP32
+# main.py - Controller principale Ambilight ESP32
 # =============================================================================
 
 import sys
@@ -23,14 +23,16 @@ import presets
 # dell'import. Se questa chiamata avvenisse dopo (es. in __init__), ui.py
 # vedrebbe ancora i default di config.py invece dei valori salvati.
 presets.impostazioni_app_applica_a_config()
+presets.calibrazione_applica_a_config()
 
 import app_detect
 from gpu_monitor import VRAMMonitor
-from utils import ScreenProcessor, _build_gamma_table
+from utils import ScreenProcessor
 from serial_comm import SerialManager
-from ui import FinestraAmbientLight, ACCENT
+from ui import FinestraAmbilight, ACCENT
 
 APP_POLL_MS = 1500  # intervallo di controllo del processo in primo piano
+SERIAL_RETRY_MS = 2000  # intervallo di riconnessione se la seriale è caduta
 
 COLORI_TEST = {
     "top":    (180, 0,   0  ),
@@ -40,7 +42,7 @@ COLORI_TEST = {
 }
 
 
-class ControllerAmbientLight:
+class ControllerAmbilight:
 
     def __init__(self):
         self.app = QApplication(sys.argv)
@@ -50,6 +52,7 @@ class ControllerAmbientLight:
         # rispetta sempre lo stylesheet dell'app.
         self.app.setStyle("Fusion")
         self.in_test   = False
+        self.cal_livello = None   # None = calibrazione spenta, altrimenti livello 0-255
         self.lati_test = {"top": False, "right": False, "bottom": False, "left": False}
 
         self._tick_count = 0
@@ -80,16 +83,24 @@ class ControllerAmbientLight:
         self.processor.set_seriale(self.seriale)
         self._verifica_num_led()
 
-        self.finestra = FinestraAmbientLight(stato_seriale=self.seriale.stato)
+        self.finestra = FinestraAmbilight(stato_seriale=self.seriale.stato)
 
         # ---- Collega segnali ----
         imp = self.finestra.tab_impostazioni
         imp.depth_cambiato.connect(self._on_depth)
         imp.offset_cambiato.connect(self._on_offset)
+        imp.campionamento_cambiato.connect(self._on_campionamento)
+        imp.area_depth_cambiato.connect(self._on_area_depth)
+        imp.area_forma_cambiata.connect(self._on_area_forma)
+        imp.calibrazione_pattern.connect(self._on_calibrazione_pattern)
+        imp.gain_bianco_cambiati.connect(self._on_gain_bianco)
+        imp.blackbar_soglia_cambiata.connect(self._on_blackbar_soglia)
         imp.gamma_cambiato.connect(self._on_gamma)
         imp.soglia_cambiata.connect(self._on_soglia)
         imp.smoothing_cambiato.connect(self._on_smoothing)
         imp.snap_cambiato.connect(self._on_snap)
+        imp.modo_transizione_cambiato.connect(self._on_modo_transizione)
+        imp.y_limit_cambiato.connect(self._on_y_limit)
         imp.fps_cambiato.connect(self._on_fps)
         imp.saturazione_cambiata.connect(self._on_saturazione)
         imp.blackbar_cambiato.connect(self._on_blackbar)
@@ -122,6 +133,17 @@ class ControllerAmbientLight:
         self.app_timer.timeout.connect(self._controlla_app_attiva)
         self.app_timer.start(APP_POLL_MS)
 
+        self._cal_save_timer = QTimer()
+        self._cal_save_timer.setSingleShot(True)
+        self._cal_save_timer.timeout.connect(presets.calibrazione_salva)
+
+        self.serial_timer = QTimer()
+        self.serial_timer.timeout.connect(self._riprova_seriale)
+        self.serial_timer.start(SERIAL_RETRY_MS)
+
+        # L'anteprima disegna le aree di campionamento reali e le barre rilevate
+        self.finestra.tab_impostazioni.anteprima.sorgente_geometria = self.processor.geometria_aree
+
         self.finestra.show()
         presets.assicura_profili_default()
         self._carica_preset_iniziale()
@@ -142,9 +164,24 @@ class ControllerAmbientLight:
         config.SAMPLE_OFFSET_RATIO = val
         self.finestra.tab_impostazioni.aggiorna_offset_anteprima(val)
 
+    def _on_campionamento(self, modo: str):
+        config.SAMPLING_MODE = modo
+        self.finestra.tab_impostazioni.aggiorna_campionamento_anteprima()
+
+    def _on_area_depth(self, dh: float, dv: float):
+        config.AREA_DEPTH_H = dh
+        config.AREA_DEPTH_V = dv
+        self.finestra.tab_impostazioni.aggiorna_campionamento_anteprima()
+
+    def _on_area_forma(self, forma: str, tile: float):
+        config.AREA_FORMA = forma
+        config.AREA_TILE = tile
+
+    def _on_blackbar_soglia(self, val: int):
+        config.BLACKBAR_SOGLIA = val
+
     def _on_gamma(self, val: float):
-        config.GAMMA = val
-        self._ricostruisci_gamma()
+        config.GAMMA = val   # letta a ogni frame da ScreenProcessor._calcola
 
     def _on_soglia(self, val: int):
         config.SOGLIA_MINIMA = val
@@ -154,6 +191,12 @@ class ControllerAmbientLight:
 
     def _on_snap(self, val: int):
         config.SNAP_THRESHOLD = val
+
+    def _on_modo_transizione(self, val: str):
+        config.SMOOTHING_MODE = val
+
+    def _on_y_limit(self, val: float):
+        config.Y_LIMIT = val
 
     def _on_fps(self, val: int):
         config.TARGET_FPS = val
@@ -175,7 +218,23 @@ class ControllerAmbientLight:
 
     def _on_modalita_test(self, attivo: bool):
         self.in_test = attivo
-        if not attivo:
+        self._aggiorna_modalita_esclusiva()
+
+    def _on_calibrazione_pattern(self, livello: int):
+        self.cal_livello = None if livello < 0 else livello
+        self._aggiorna_modalita_esclusiva()
+
+    def _on_gain_bianco(self, gains: list):
+        # Assegnazione atomica (il thread di cattura legge senza lock)
+        config.WHITE_GAINS = [float(x) for x in gains]
+        self._cal_save_timer.start(600)   # scrive su disco a slider fermo
+
+    def _aggiorna_modalita_esclusiva(self):
+        """Test LED e calibrazione prendono il controllo dei LED: il thread di
+        cattura smette di scrivere, e al ritorno allo schermo si azzera lo stato."""
+        esclusiva = self.in_test or self.cal_livello is not None
+        self.processor.invio_attivo = not esclusiva
+        if not esclusiva:
             self.processor.smoother.reset()
             self.processor.barre.reset()
 
@@ -191,7 +250,6 @@ class ControllerAmbientLight:
             if params:
                 presets.applica_a_config(params)
                 self.finestra.tab_impostazioni.applica_valori(params)
-                self._ricostruisci_gamma()
                 print(f"[Preset] Auto-caricato: '{nome}'")
         self.finestra.tab_impostazioni.aggiorna_lista_preset(tutti, nome or "")
 
@@ -206,16 +264,12 @@ class ControllerAmbientLight:
             presets.applica_a_config(params)
             presets.salva_ultimo(nome)
             self.finestra.tab_impostazioni.applica_valori(params)
-            self._ricostruisci_gamma()
             self.processor.smoother.reset()
             self.processor.barre.reset()
 
     def _on_preset_elimina(self, nome: str):
         presets.elimina(nome)
         self.finestra.tab_impostazioni.aggiorna_lista_preset(presets.nomi())
-
-    def _ricostruisci_gamma(self):
-        self.processor._gamma = _build_gamma_table(config.GAMMA)
 
     def _verifica_num_led(self):
         """Chiede al firmware quanti LED ha configurati e segnala se non
@@ -233,6 +287,12 @@ class ControllerAmbientLight:
                   f"(LED_TOP+LED_BOTTOM+LED_LEFT+LED_RIGHT) — controlla config.py.")
         else:
             print(f"[Seriale] Numero LED verificato: {rilevati} (corrisponde a config.py)")
+
+    def _riprova_seriale(self):
+        if self.seriale.connesso:
+            return
+        if self.seriale.riconnetti():
+            self._verifica_num_led()
 
     # =========================================================================
     # System tray
@@ -258,7 +318,7 @@ class ControllerAmbientLight:
 
         if attivo and self._tray is None:
             self._tray = QSystemTrayIcon(self._crea_icona_tray())
-            self._tray.setToolTip("Ambient Light ESP32")
+            self._tray.setToolTip("Ambilight ESP32")
             menu = QMenu()
             azione_mostra = menu.addAction("Mostra")
             azione_mostra.triggered.connect(self._mostra_finestra)
@@ -274,7 +334,7 @@ class ControllerAmbientLight:
 
     def _on_bordo_finestra(self, valore: str):
         # Solo persistenza — richiede riavvio per applicarsi (i flag di
-        # finestra vanno impostati prima di show(), vedi FinestraAmbientLight).
+        # finestra vanno impostati prima di show(), vedi FinestraAmbilight).
         config.WINDOW_BORDER = valore
         presets.impostazioni_app_scrivi({"WINDOW_BORDER": valore})
 
@@ -332,7 +392,6 @@ class ControllerAmbientLight:
         if params:
             presets.applica_a_config(params)
             self.finestra.tab_impostazioni.applica_valori(params)
-            self._ricostruisci_gamma()
             self.processor.smoother.reset()
             self.processor.barre.reset()
             self._profilo_auto_attivo = nome
@@ -373,19 +432,26 @@ class ControllerAmbientLight:
             stats["fps_ui"] = self._fps_ui
             stats.update(self._stats_cache)
 
-            if self.in_test:
-                colori = self._colori_test()
-                self.finestra.aggiorna_colori(colori)
-                self.seriale.invia_colori(colori)
+            if self.in_test or self.cal_livello is not None:
+                colori = (self._colori_test() if self.in_test
+                          else self.processor.colori_pattern(self.cal_livello))
+                if self.seriale.buffer_libero():
+                    self.seriale.invia_colori(colori)
             else:
                 colori = self.processor.calcola_colori()
-                self.finestra.aggiorna_colori(colori)
 
-            self.finestra.aggiorna_stats(stats)
-            self.finestra.aggiorna_stato_seriale(self.seriale.stato)
+            # Finestra nascosta nel tray o minimizzata: nessuno guarda la
+            # preview, quindi si salta l'aggiornamento dei widget.
+            if self._finestra_visibile():
+                self.finestra.aggiorna_colori(colori)
+                self.finestra.aggiorna_stats(stats)
+                self.finestra.aggiorna_stato_seriale(self.seriale.stato)
 
         except Exception as e:
             print(f"[Main] Errore tick: {e}")
+
+    def _finestra_visibile(self) -> bool:
+        return self.finestra.isVisible() and not self.finestra.isMinimized()
 
     def _colori_test(self) -> list:
         colori = []
@@ -405,6 +471,7 @@ class ControllerAmbientLight:
         codice = self.app.exec()
         self.timer.stop()
         self.app_timer.stop()
+        self.serial_timer.stop()
         self._vram.stop()
         if self._tray is not None:
             self._tray.hide()
@@ -415,9 +482,9 @@ class ControllerAmbientLight:
 
 def main():
     print("=" * 50)
-    print("  Ambient Light ESP32")
+    print("  Ambilight ESP32")
     print("=" * 50)
-    ctrl = ControllerAmbientLight()
+    ctrl = ControllerAmbilight()
     sys.exit(ctrl.esegui())
 
 

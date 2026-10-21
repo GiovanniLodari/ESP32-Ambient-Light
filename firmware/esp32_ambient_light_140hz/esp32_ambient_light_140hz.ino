@@ -1,7 +1,7 @@
 // =============================================================================
-// esp32_ambient_light_140hz.ino
+// esp32_ambilight.cpp
 // Protocollo: MAGIC(4) + NUM_LED(2 BE) + RGB×N + CRC8
-// Rendering: lerp interno a 120Hz indipendente dalla ricezione seriale
+// Rendering: i LED si aggiornano UNA volta per pacchetto valido ricevuto.
 // =============================================================================
 
 #include <Adafruit_NeoPixel.h>
@@ -11,25 +11,20 @@
 #define LED_COUNT     60
 #define BAUD_RATE     460800
 
-// --- Lerp interno ---
-// Quanti step di interpolazione fare tra un pacchetto e il successivo.
-// A 30fps Python + LERP_STEPS=4 → rendering a 120Hz
-// Aumenta per transizioni più morbide, diminuisci se vedi lag
-// Lerp disabilitato: colori applicati istantaneamente al ricevimento pacchetto
-// Le transizioni morbide sono gestite interamente da Python (SMOOTHING_FACTOR)
-#define LERP_STEPS        1
-#define LERP_INTERVAL_MS  1
+// Buffer RX della seriale. Un pacchetto è 4+2+LED_COUNT*3+1 byte (187 con 60
+// LED) e strip.show() blocca per ~2ms durante i quali arrivano ~90 byte: con
+// il default di 256 il margine è minimo. Va impostato PRIMA di Serial.begin().
+#define SERIAL_RX_BUFFER 1024
+
+// Smoothing: gestito interamente da Python (SMOOTHING_FACTOR) — il firmware
+// applica i colori ricevuti così come sono. Non c'è più nessun lerp interno
+// (con LERP_STEPS=1 era un'identità, ma riscriveva comunque i LED ogni 1ms
+// con gli stessi dati, tenendo il loop quasi sempre dentro strip.show()).
 
 // --- Timeout: spegni se non arrivano pacchetti ---
 #define TIMEOUT_MS   3000
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
-
-// --- Stato colori ---
-// current: colore attualmente mostrato (fixed point ×256 per precisione)
-// target:  ultimo colore ricevuto via seriale
-int32_t cur_r[LED_COUNT], cur_g[LED_COUNT], cur_b[LED_COUNT];
-uint8_t tgt_r[LED_COUNT], tgt_g[LED_COUNT], tgt_b[LED_COUNT];
 
 // --- Parser seriale a macchina a stati ---
 static const uint8_t MAGIC[4] = {0x41, 0x64, 0x61, 0x6C};
@@ -49,10 +44,9 @@ uint8_t buf_r, buf_g;
 uint8_t crc_calc = 0;
 uint8_t tmp_r[LED_COUNT], tmp_g[LED_COUNT], tmp_b[LED_COUNT];
 
-// --- Timing ---
+// --- Timing / stato ---
 unsigned long ultimo_pacchetto = 0;
-unsigned long ultimo_lerp = 0;
-uint8_t lerp_step = 0;
+bool spento = true;   // true = i LED sono già stati spenti, niente show() inutili
 
 // --- CRC8 (Dallas/Maxim, poly 0x07) ---
 uint8_t crc8_byte(uint8_t crc, uint8_t byte) {
@@ -62,44 +56,29 @@ uint8_t crc8_byte(uint8_t crc, uint8_t byte) {
   return crc;
 }
 
-// --- Lerp fixed-point: avanza current verso target di 1/LERP_STEPS ---
-void lerp_step_avanza() {
-  for (int i = 0; i < LED_COUNT; i++) {
-    int32_t tr = (int32_t)tgt_r[i] << 8;
-    int32_t tg = (int32_t)tgt_g[i] << 8;
-    int32_t tb = (int32_t)tgt_b[i] << 8;
-    cur_r[i] += (tr - cur_r[i]) / LERP_STEPS;
-    cur_g[i] += (tg - cur_g[i]) / LERP_STEPS;
-    cur_b[i] += (tb - cur_b[i]) / LERP_STEPS;
-  }
-}
-
-void applica_al_led() {
-  for (int i = 0; i < LED_COUNT; i++)
-    strip.setPixelColor(i, cur_r[i] >> 8, cur_g[i] >> 8, cur_b[i] >> 8);
+// Scrive i colori del pacchetto appena validato e li mostra (un solo show()).
+// Se il pacchetto contiene meno LED di LED_COUNT gli altri restano invariati.
+void applica_pacchetto(uint16_t quanti) {
+  for (uint16_t i = 0; i < quanti; i++)
+    strip.setPixelColor(i, tmp_r[i], tmp_g[i], tmp_b[i]);
   strip.show();
+  spento = false;
 }
 
 void spegni_tutto() {
-  for (int i = 0; i < LED_COUNT; i++) {
-    tgt_r[i] = tgt_g[i] = tgt_b[i] = 0;
-  }
+  strip.clear();
+  strip.show();
+  spento = true;
 }
 
 void setup() {
+  Serial.setRxBufferSize(SERIAL_RX_BUFFER);
   Serial.begin(BAUD_RATE);
   strip.begin();
   strip.setBrightness(255);
   strip.clear();
   strip.show();
-  memset(cur_r, 0, sizeof(cur_r));
-  memset(cur_g, 0, sizeof(cur_g));
-  memset(cur_b, 0, sizeof(cur_b));
-  memset(tgt_r, 0, sizeof(tgt_r));
-  memset(tgt_g, 0, sizeof(tgt_g));
-  memset(tgt_b, 0, sizeof(tgt_b));
   ultimo_pacchetto = millis();
-  ultimo_lerp = millis();
 }
 
 void loop() {
@@ -152,12 +131,8 @@ void loop() {
 
       case LEGGI_CRC:
         if (b == crc_calc) {
-          // Pacchetto valido: aggiorna i target
-          for (uint16_t i = 0; i < num_led; i++) {
-            tgt_r[i] = tmp_r[i];
-            tgt_g[i] = tmp_g[i];
-            tgt_b[i] = tmp_b[i];
-          }
+          // Pacchetto valido: mostra subito
+          applica_pacchetto(num_led);
           ultimo_pacchetto = millis();
         }
         stato = ATTENDI_MAGIC;
@@ -165,15 +140,8 @@ void loop() {
     }
   }
 
-  // --- 2. Timeout: avvia transizione verso nero ---
-  if (millis() - ultimo_pacchetto > TIMEOUT_MS) {
+  // --- 2. Timeout: nessun pacchetto da TIMEOUT_MS -> spegni (una volta sola) ---
+  if (!spento && millis() - ultimo_pacchetto > TIMEOUT_MS) {
     spegni_tutto();
-  }
-
-  // --- 3. Lerp interno a ~120Hz ---
-  if (millis() - ultimo_lerp >= LERP_INTERVAL_MS) {
-    ultimo_lerp = millis();
-    lerp_step_avanza();
-    applica_al_led();
   }
 }

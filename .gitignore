@@ -7,3 +7,5 @@ venv/
 .last_preset
 impostazioni_app.json
 app_profiles.json
+calibrazione.json
+.backup/

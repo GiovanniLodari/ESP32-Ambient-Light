@@ -6,16 +6,19 @@ Personal hardware + software project. Inspired by *OziLight* by Oscar Liang, rew
 
 ## How it works
 
-1. **Capture**: the screen is grabbed with `mss` and sampled in zones along the four edges, one zone per LED. The sampling depth adapts to the monitor resolution.
-2. **Colour processing**: averaging per zone, smoothing with a snap threshold (so scene cuts are still instant), gamma correction, saturation boost, a 3×3 colour-correction matrix to balance the strip's white point, and dynamic **black-bar detection** for letterboxed video.
-3. **Transport**: frames go over USB serial (460800 baud) with a small custom protocol: magic bytes, LED count, RGB values and a CRC8 checksum. The firmware checks the checksum, and turns the strip off if no valid packet arrives for 3 seconds. The application can also ask the firmware how many LEDs it was built for, to catch a mismatch with `config.py`.
+1. **Capture**: the screen is grabbed on the GPU with `dxcam` (falling back to `mss`) and reduced to a small thumbnail that covers the whole screen at any resolution. Each LED gets its own sampling area along the edges; two sampling modes are available (see *Features*).
+2. **Colour processing**: averaging per area in linear light, dynamic **black-bar detection** that crops the sampling area for letterboxed video, smoothing (with a snap threshold so scene cuts are still instant, and an optional luminance limit against flashes), saturation boost, a 3×3 colour matrix plus white-balance gains, gamma applied in floating point and **temporal dithering** to keep dark scenes smooth, and an optional power limit.
+3. **Transport**: frames go over USB serial (460800 baud) with a small custom protocol: magic bytes, LED count, RGB values and a CRC8 checksum. The firmware checks the checksum, refreshes the strip once per valid packet, and turns it off if no valid packet arrives for 3 seconds. The application reconnects by itself if the serial port drops. The application can also ask the firmware how many LEDs it was built for, to catch a mismatch with `config.py`.
 4. **Rendering**: the ESP32 sketch writes the colours to the strip with the Adafruit NeoPixel library.
 
 ## Features
 
 - Live preview and settings in a **PyQt6** interface, with light and dark themes and an optional tray icon.
-- **Presets** (for example *Film* and *Gaming*) that change smoothing, snap threshold and frame rate, saved to `presets.json`.
+- **Two sampling modes**: *Original* (thick inset bands, average of the brightest pixels) and *Areas* (thin areas along the edge, average of all pixels, either as the LED's whole segment or as a fixed-size square), with an on-screen preview of the exact sampled areas and of the detected black bars.
+- **Two transition styles**: *Exponential* (fast attack, soft decay) and *Spring* (damped spring in YUV), with an optional per-second luminance limit.
+- **Presets** (for example *Film* and *Gaming*) that change smoothing, sampling, snap threshold and frame rate, saved to `presets.json`.
 - **Per-application profiles**: the active preset can switch automatically according to the foreground process (Windows).
+- **White-balance calibration** in the *Colour* page: uniform white/grey patterns shown through the real processing chain, and per-channel gains. The gains describe the physical strip, so they are stored separately in `calibrazione.json` (not tracked) and are not changed by loading a preset.
 - A **calibration tool** (`debug_gui.py`) to light each side of the strip, check the physical LED order and tune the sampling depth while seeing the sampled area.
 - Diagnostic scripts to test the connection, the side order, single colours, a rainbow sweep and stability.
 

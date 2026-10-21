@@ -482,7 +482,11 @@ class AntepimaSchermo(QWidget):
         self.setFixedSize(440, 248)
         self.depth_ratio  = config.SAMPLE_DEPTH_RATIO
         self.offset_ratio = config.SAMPLE_OFFSET_RATIO
+        self.modo = config.SAMPLING_MODE
+        self.area_h = config.AREA_DEPTH_H
+        self.area_v = config.AREA_DEPTH_V
         self.pixmap = None
+        self.sorgente_geometria = None   # callable -> dict da ScreenProcessor.geometria_aree()
 
     def aggiorna_screenshot(self):
         try:
@@ -508,29 +512,73 @@ class AntepimaSchermo(QWidget):
         self.offset_ratio = ratio
         self.update()
 
+    def set_campionamento(self, modo, area_h, area_v):
+        self.modo, self.area_h, self.area_v = modo, area_h, area_v
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         w, h = self.width(), self.height()
-        dx = int(w * self.depth_ratio)
-        dy = int(h * self.depth_ratio)
-        ox = int(w * self.offset_ratio)
-        oy = int(h * self.offset_ratio)
+        if self.modo == "aree":
+            # bande a filo bordo, come _campiona_aree
+            dx, dy = int(w * self.area_v), int(h * self.area_h)
+            ox = oy = 0
+        else:
+            # profondità effettiva: ScreenProcessor applica un minimo di
+            # SAMPLE_DEPTH_MIN pixel della miniatura 256x144, quindi le bande
+            # sopra/sotto sono più spesse del valore nominale dello slider.
+            dx = int(w * max(int(256 * self.depth_ratio), config.SAMPLE_DEPTH_MIN) / 256)
+            dy = int(h * max(int(144 * self.depth_ratio), config.SAMPLE_DEPTH_MIN) / 144)
+            ox = int(w * self.offset_ratio)
+            oy = int(h * self.offset_ratio)
 
         if self.pixmap:
             painter.drawPixmap(0, 0, self.pixmap)
         else:
             painter.fillRect(0, 0, w, h, QColor(BG_INPUT))
 
-        overlay = {
-            "top":    (ox,          oy,          w - 2*ox, dy,       QColor(217, 122, 122, 90)),
-            "bottom": (ox,          h - oy - dy, w - 2*ox, dy,       QColor(122, 154, 217, 90)),
-            "left":   (ox,          oy,          dx,       h - 2*oy, QColor(217, 201, 122, 90)),
-            "right":  (w - ox - dx, oy,          dx,       h - 2*oy, QColor(122, 196, 138, 90)),
-        }
-        painter.setPen(Qt.PenStyle.NoPen)
-        for _, (x, y, lw, lh, col) in overlay.items():
-            painter.setBrush(QBrush(col))
-            painter.drawRect(x, y, lw, lh)
+        colori_lato = (QColor(122, 196, 138, 110),   # destra
+                       QColor(217, 122, 122, 110),   # sopra
+                       QColor(217, 201, 122, 110),   # sinistra
+                       QColor(122, 154, 217, 110))   # sotto
+        geom = None
+        if self.sorgente_geometria is not None:
+            try:
+                geom = self.sorgente_geometria()
+            except Exception:
+                geom = None
+
+        if self.modo == "aree" and geom is not None:
+            # le aree reali di ogni LED, già ritagliate sulle barre rilevate
+            tw, th = geom["thumb"]
+            sx, sy = w / tw, h / th
+            lati = np.repeat([0, 1, 2, 3], [config.LED_RIGHT, config.LED_TOP, config.LED_LEFT, config.LED_BOTTOM])
+            painter.setPen(QPen(QColor(255, 255, 255, 140), 1))
+            for (x0, x1, y0, y1), lato in zip(geom["rects"], lati):
+                painter.setBrush(QBrush(colori_lato[lato]))
+                painter.drawRect(int(x0 * sx), int(y0 * sy), max(1, int((x1 - x0) * sx)), max(1, int((y1 - y0) * sy)))
+        else:
+            overlay = {
+                "top":    (ox,          oy,          w - 2*ox, dy,       colori_lato[1]),
+                "bottom": (ox,          h - oy - dy, w - 2*ox, dy,       colori_lato[3]),
+                "left":   (ox,          oy,          dx,       h - 2*oy, colori_lato[2]),
+                "right":  (w - ox - dx, oy,          dx,       h - 2*oy, colori_lato[0]),
+            }
+            painter.setPen(Qt.PenStyle.NoPen)
+            for _, (x, y, lw, lh, col) in overlay.items():
+                painter.setBrush(QBrush(col))
+                painter.drawRect(x, y, lw, lh)
+
+        # barre nere rilevate: contorno del contenuto
+        if geom is not None:
+            tw, th = geom["thumb"]
+            cx0, cx1, cy0, cy1 = geom["area"]
+            if (cx0, cx1, cy0, cy1) != (0, tw, 0, th):
+                penna = QPen(QColor(90, 230, 120), 2, Qt.PenStyle.DashLine)
+                painter.setPen(penna)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(int(cx0 * w / tw), int(cy0 * h / th),
+                                 int((cx1 - cx0) * w / tw), int((cy1 - cy0) * h / th))
 
         painter.setPen(QPen(QColor(BORDER), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -643,10 +691,18 @@ class TabImpostazioni(QWidget):
     # Parametri
     depth_cambiato       = pyqtSignal(float)
     offset_cambiato       = pyqtSignal(float)
+    campionamento_cambiato = pyqtSignal(str)        # "originale" | "aree"
+    area_depth_cambiato     = pyqtSignal(float, float)   # profondità alto/basso, laterale
+    area_forma_cambiata     = pyqtSignal(str, float)     # "segmento" | "quadrato", lato
+    blackbar_soglia_cambiata = pyqtSignal(int)
+    calibrazione_pattern  = pyqtSignal(int)    # livello sRGB 0-255, -1 = spento
+    gain_bianco_cambiati  = pyqtSignal(list)   # [r, g, b] 0.3-1.0
     gamma_cambiato        = pyqtSignal(float)
     soglia_cambiata       = pyqtSignal(int)
     smoothing_cambiato    = pyqtSignal(float)
     snap_cambiato         = pyqtSignal(int)
+    modo_transizione_cambiato = pyqtSignal(str)    # "esponenziale" | "molla"
+    y_limit_cambiato      = pyqtSignal(float)      # frazioni di fondo scala al secondo, 0 = off
     fps_cambiato          = pyqtSignal(int)
     saturazione_cambiata  = pyqtSignal(float)
     blackbar_cambiato     = pyqtSignal(bool)
@@ -677,11 +733,15 @@ class TabImpostazioni(QWidget):
         self.timer_shot = QTimer()
         self.timer_shot.timeout.connect(self.anteprima.aggiorna_screenshot)
         self.timer_shot.start(2000)
+        # L'overlay (barre rilevate, aree dei LED) cambia molto più spesso dello screenshot
+        self.timer_overlay = QTimer()
+        self.timer_overlay.timeout.connect(self._ridisegna_anteprima)
+        self.timer_overlay.start(250)
         self.anteprima.aggiorna_screenshot()
 
     # -----------------------------------------------------------------------
     # Build: crea le 4 pagine come attributi (pagina_calibrazione, ecc.) —
-    # è FinestraAmbientLight a montarle nello QStackedWidget della sidebar.
+    # è FinestraAmbilight a montarle nello QStackedWidget della sidebar.
     # -----------------------------------------------------------------------
     def _build(self):
         self.pagina_calibrazione = self._pagina_calibrazione()
@@ -721,6 +781,40 @@ class TabImpostazioni(QWidget):
             lambda v: self.offset_cambiato.emit(v / 100.0))
         aggiungi_riga(v_ant, "Offset dal bordo", row_w)
 
+        self.combo_campionamento = QComboBox()
+        self.combo_campionamento.addItem("Originale (bande spesse, pixel più luminosi)", "originale")
+        self.combo_campionamento.addItem("Aree (bande sottili a filo bordo, media di tutti i pixel)", "aree")
+        self.combo_campionamento.setCurrentIndex(
+            max(0, self.combo_campionamento.findData(getattr(config, "SAMPLING_MODE", "originale"))))
+        self.combo_campionamento.currentIndexChanged.connect(
+            lambda: self.campionamento_cambiato.emit(self.combo_campionamento.currentData()))
+        aggiungi_riga(v_ant, "Campionamento", self.combo_campionamento)
+
+        def emetti_area(_=None):
+            self.area_depth_cambiato.emit(self._sl_area_h.value() / 100.0, self._sl_area_v.value() / 100.0)
+
+        row_w, self._sl_area_h = crea_slider_riga(
+            1, 30, int(round(config.AREA_DEPTH_H * 100)), lambda v: f"{v}%", emetti_area)
+        aggiungi_riga(v_ant, "Aree: alto/basso", row_w)
+
+        row_w, self._sl_area_v = crea_slider_riga(
+            1, 30, int(round(config.AREA_DEPTH_V * 100)), lambda v: f"{v}%", emetti_area)
+        aggiungi_riga(v_ant, "Aree: lati", row_w)
+
+        self.combo_forma = QComboBox()
+        self.combo_forma.addItem("Segmento (tutto il tratto del LED)", "segmento")
+        self.combo_forma.addItem("Quadrato fisso (più dettaglio)", "quadrato")
+        self.combo_forma.setCurrentIndex(max(0, self.combo_forma.findData(config.AREA_FORMA)))
+        aggiungi_riga(v_ant, "Aree: forma", self.combo_forma)
+
+        def emetti_forma(_=None):
+            self.area_forma_cambiata.emit(self.combo_forma.currentData(), self._sl_area_tile.value() / 100.0)
+
+        row_w, self._sl_area_tile = crea_slider_riga(
+            2, 20, int(round(config.AREA_TILE * 100)), lambda v: f"{v}%", emetti_forma)
+        aggiungi_riga(v_ant, "Aree: lato quadrato", row_w)
+        self.combo_forma.currentIndexChanged.connect(emetti_forma)
+
         v.addWidget(card_ant)
 
         card_lati, v_lati = crea_card("Test lati (accende i LED fisici con colori fissi)")
@@ -750,7 +844,7 @@ class TabImpostazioni(QWidget):
         cross.addWidget(self.btn_off,    2, 2)
         v_lati.addLayout(cross)
 
-        self.chk_test = QCheckBox("Blocca Ambient Light durante il test")
+        self.chk_test = QCheckBox("Blocca Ambilight durante il test")
         self.chk_test.setChecked(True)
         v_lati.addWidget(self.chk_test)
 
@@ -802,6 +896,21 @@ class TabImpostazioni(QWidget):
             lambda v: self.snap_cambiato.emit(v))
         aggiungi_riga(v_par, "Snap soglia (scena)", row_w)
 
+        self.combo_transizione = QComboBox()
+        self.combo_transizione.addItem("Esponenziale (attacco rapido)", "esponenziale")
+        self.combo_transizione.addItem("Molla YUV (con inerzia, simmetrica)", "molla")
+        self.combo_transizione.setCurrentIndex(
+            max(0, self.combo_transizione.findData(getattr(config, "SMOOTHING_MODE", "esponenziale"))))
+        self.combo_transizione.currentIndexChanged.connect(
+            lambda: self.modo_transizione_cambiato.emit(self.combo_transizione.currentData()))
+        aggiungi_riga(v_par, "Transizione", self.combo_transizione)
+
+        row_w, self._sl_ylimit = crea_slider_riga(
+            0, 50, int(round(getattr(config, "Y_LIMIT", 0.0) * 10)),
+            lambda v: f"{v/10:.1f}/s" if v > 0 else "OFF",
+            lambda v: self.y_limit_cambiato.emit(v / 10.0))
+        aggiungi_riga(v_par, "Limite luminanza", row_w)
+
         v.addWidget(card)
 
         card2, v_perf = crea_card("Performance")
@@ -819,6 +928,11 @@ class TabImpostazioni(QWidget):
         self.chk_blackbar.setChecked(getattr(config, "BLACKBAR_DETECTION", True))
         self.chk_blackbar.toggled.connect(self.blackbar_cambiato.emit)
         v_perf.addWidget(self.chk_blackbar)
+
+        row_w, self._sl_bb_soglia = crea_slider_riga(
+            0, 60, config.BLACKBAR_SOGLIA, lambda v: str(v),
+            lambda v: self.blackbar_soglia_cambiata.emit(v))
+        aggiungi_riga(v_perf, "Soglia nero barre", row_w)
 
         v.addWidget(card2)
         v.addStretch()
@@ -936,8 +1050,74 @@ class TabImpostazioni(QWidget):
         v_col.addWidget(self.btn_reset_matrix, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         v.addWidget(card)
+
+        # ---- Calibrazione del bianco: pattern uniforme + guadagni R/G/B ----
+        card_cal, v_cal = crea_card("Calibrazione bianco — guadagni della strip")
+
+        istruzioni = QLabel(
+            "1. Scegli un pattern: tutti i LED mostrano quel grigio attraverso la stessa "
+            "elaborazione dello schermo.\n"
+            "2. Guarda la luce sul muro dietro il monitor (o su un foglio bianco): deve sembrare "
+            "neutra, senza dominante. Riduci il canale in eccesso (di solito verde o blu sulle WS2812).\n"
+            "3. Ripeti con i grigi scuri: contano quanto il bianco, perché le scene scure sono "
+            "quelle in cui la dominante si nota di più.\n"
+            "Nota: un guadagno g riduce la luce emessa di circa g^2.2 (90% → −21%).")
+        istruzioni.setObjectName("MutedLabel")
+        istruzioni.setWordWrap(True)
+        v_cal.addWidget(istruzioni)
+
+        riga_pat = QHBoxLayout()
+        self._btn_pattern = {}
+        for etichetta, livello in (("Bianco 100%", 255), ("Grigio 50%", 128),
+                                   ("Grigio 25%", 64), ("Grigio 10%", 26)):
+            b = QPushButton(etichetta)
+            b.setCheckable(True)
+            b.setObjectName("BtnUtility")
+            b.clicked.connect(lambda _c, l=livello: self._on_pattern_calibrazione(l))
+            riga_pat.addWidget(b)
+            self._btn_pattern[livello] = b
+        b_stop = QPushButton("Stop")
+        b_stop.setObjectName("BtnUtility")
+        b_stop.clicked.connect(lambda: self._on_pattern_calibrazione(-1))
+        riga_pat.addWidget(b_stop)
+        v_cal.addLayout(riga_pat)
+
+        avviso = QLabel("Il bianco 100% su tutti i LED assorbe la corrente massima della strip "
+                        "(~3.6 A con 60 LED): usalo solo con alimentazione adeguata, "
+                        "altrimenti calibra con i grigi.")
+        avviso.setObjectName("MutedLabel")
+        avviso.setWordWrap(True)
+        v_cal.addWidget(avviso)
+
+        self._sl_gain = []
+        for i, nome in enumerate(("Rosso", "Verde", "Blu")):
+            row_w, sl = crea_slider_riga(
+                30, 100, int(round(config.WHITE_GAINS[i] * 100)),
+                lambda val: f"{val}%",
+                lambda _v: self._emetti_gain_bianco())
+            aggiungi_riga(v_cal, f"Guadagno {nome}", row_w)
+            self._sl_gain.append(sl)
+
+        btn_reset_gain = QPushButton("Reset guadagni (100%)")
+        btn_reset_gain.setObjectName("BtnUtility")
+        btn_reset_gain.clicked.connect(self._on_reset_gain_bianco)
+        v_cal.addWidget(btn_reset_gain, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        v.addWidget(card_cal)
         v.addStretch()
         return pagina
+
+    def _on_pattern_calibrazione(self, livello: int):
+        for l, b in self._btn_pattern.items():
+            b.setChecked(l == livello)
+        self.calibrazione_pattern.emit(livello)
+
+    def _emetti_gain_bianco(self):
+        self.gain_bianco_cambiati.emit([sl.value() / 100.0 for sl in self._sl_gain])
+
+    def _on_reset_gain_bianco(self):
+        for sl in self._sl_gain:
+            sl.setValue(100)   # emette tramite valueChanged
 
     # ---- Pagina: Aspetto --------------------------------------------------
     def _pagina_aspetto(self) -> QWidget:
@@ -1213,6 +1393,26 @@ class TabImpostazioni(QWidget):
             if key in params:
                 slider.setValue(to_int(params[key]))  # attiva valueChanged → aggiorna config
 
+        if "SAMPLING_MODE" in params:
+            idx = self.combo_campionamento.findData(params["SAMPLING_MODE"])
+            self.combo_campionamento.setCurrentIndex(max(0, idx))
+
+        if "AREA_FORMA" in params:
+            self.combo_forma.setCurrentIndex(max(0, self.combo_forma.findData(params["AREA_FORMA"])))
+        if "AREA_TILE" in params:
+            self._sl_area_tile.setValue(int(round(params["AREA_TILE"] * 100)))
+
+        for chiave, slider in (("AREA_DEPTH_H", self._sl_area_h), ("AREA_DEPTH_V", self._sl_area_v)):
+            if chiave in params:
+                slider.setValue(int(round(params[chiave] * 100)))
+
+        if "SMOOTHING_MODE" in params:
+            idx = self.combo_transizione.findData(params["SMOOTHING_MODE"])
+            self.combo_transizione.setCurrentIndex(max(0, idx))
+
+        if "Y_LIMIT" in params:
+            self._sl_ylimit.setValue(int(round(params["Y_LIMIT"] * 10)))
+
         if "TARGET_FPS" in params:
             idx = FPS_INDICE.get(params["TARGET_FPS"], 1)
             self.combo_fps.setCurrentIndex(idx)
@@ -1226,6 +1426,13 @@ class TabImpostazioni(QWidget):
     def aggiorna_depth_anteprima(self, ratio):
         self.anteprima.set_depth(ratio)
         self.anteprima.aggiorna_screenshot()
+
+    def _ridisegna_anteprima(self):
+        if self.anteprima.isVisible():
+            self.anteprima.update()
+
+    def aggiorna_campionamento_anteprima(self):
+        self.anteprima.set_campionamento(config.SAMPLING_MODE, config.AREA_DEPTH_H, config.AREA_DEPTH_V)
 
     def aggiorna_offset_anteprima(self, ratio):
         self.anteprima.set_offset(ratio)
@@ -1357,12 +1564,12 @@ class GrippoRidimensionamento(QWidget):
         super().mousePressEvent(event)
 
 
-class FinestraAmbientLight(QMainWindow):
+class FinestraAmbilight(QMainWindow):
     MARGINE_RESIZE = 6
 
     def __init__(self, stato_seriale: str = ""):
         super().__init__()
-        self.setWindowTitle("Ambient Light ESP32")
+        self.setWindowTitle("Ambilight ESP32")
         self.setStyleSheet(build_qss())
 
         self._bordo_senza_frame = getattr(config, "WINDOW_BORDER", "nativo") == "senza_bordo"
@@ -1386,7 +1593,7 @@ class FinestraAmbientLight(QMainWindow):
         if self._bordo_senza_frame:
             h_head.addLayout(self._crea_pallini_semaforo())
 
-        titolo = QLabel("Ambient Light")
+        titolo = QLabel("Ambilight")
         titolo.setObjectName("AppTitle")
         h_head.addWidget(titolo)
         h_head.addStretch()

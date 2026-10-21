@@ -11,9 +11,10 @@ PRESETS_FILE     = "presets.json"
 LAST_PRESET_FILE = ".last_preset"
 APP_MAP_FILE     = "app_profiles.json"
 APP_SETTINGS_FILE = "impostazioni_app.json"
+CALIBRAZIONE_FILE = "calibrazione.json"
 
 # Chiavi di config.py che sono preferenze di aspetto dell'app, non tuning del
-# segnale colore — persistite separatamente dai preset ambient light.
+# segnale colore — persistite separatamente dai preset ambilight.
 APP_SETTINGS_KEYS = [
     "THEME",
     "ACCENT_MODE",
@@ -42,11 +43,18 @@ PROFILI_DEFAULT = {
 PARAM_KEYS = [
     "SAMPLE_DEPTH_RATIO",
     "SAMPLE_OFFSET_RATIO",
+    "SAMPLING_MODE",
+    "AREA_DEPTH_H",
+    "AREA_DEPTH_V",
+    "AREA_FORMA",
+    "AREA_TILE",
     "GAMMA",
     "SATURATION_BOOST",
     "SOGLIA_MINIMA",
     "SMOOTHING_FACTOR",
     "SNAP_THRESHOLD",
+    "SMOOTHING_MODE",
+    "Y_LIMIT",
     "TARGET_FPS",
     "COLOR_MATRIX",
 ]
@@ -185,7 +193,7 @@ def mappa_app_rimuovi(exe: str):
 
 # ---------------------------------------------------------------------------
 # Impostazioni d'aspetto (tema, colore accento, bordo finestra, tray) —
-# separate dai preset ambient light: sono preferenze dell'app, non del segnale.
+# separate dai preset ambilight: sono preferenze dell'app, non del segnale.
 # ---------------------------------------------------------------------------
 
 def impostazioni_app_leggi() -> dict:
@@ -205,3 +213,19 @@ def impostazioni_app_applica_a_config():
     for k in APP_SETTINGS_KEYS:
         if k in dati and hasattr(config, k):
             setattr(config, k, dati[k])
+
+# ---------------------------------------------------------------------------
+# Calibrazione del bianco della strip — separata dai preset: è una proprietà
+# dell'hardware, e caricare un preset non deve riportarla a identità.
+# ---------------------------------------------------------------------------
+
+def calibrazione_applica_a_config():
+    """Carica i guadagni R,G,B salvati (se validi) in config.WHITE_GAINS."""
+    g = _leggi(CALIBRAZIONE_FILE).get("WHITE_GAINS")
+    if (isinstance(g, list) and len(g) == 3
+            and all(isinstance(x, (int, float)) and 0.3 <= x <= 1.0 for x in g)):
+        config.WHITE_GAINS = [float(x) for x in g]
+
+
+def calibrazione_salva():
+    _scrivi({"WHITE_GAINS": [round(float(x), 3) for x in config.WHITE_GAINS]}, CALIBRAZIONE_FILE)
