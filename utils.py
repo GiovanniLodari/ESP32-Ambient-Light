@@ -442,6 +442,9 @@ class BlackBarDetector:
     # Sul bordo in basso si ignora la fascia centrale, dove cadono i
     # sottotitoli dentro la barra nera: il centro si controlla solo in alto.
     FASCIA_LATERALE = 0.25
+    # Frazione minima di pixel luminosi nell'intero frame perché la detection
+    # sia attendibile; sotto, è una pagina/scena nera e le barre si ritirano.
+    FRAZIONE_FRAME_MIN = 0.02
     # Margine aggiunto a una barra rilevata (anti-blur).
     MARGINE_PX = 1
 
@@ -452,11 +455,12 @@ class BlackBarDetector:
     @classmethod
     def _primo_contenuto(cls, frazioni: np.ndarray, cap: int) -> int:
         """Indice (dal bordo verso il centro) della prima riga/colonna con
-        abbastanza pixel luminosi, più il margine anti-blur; `cap` se nessuna
-        lo è entro la finestra cercata."""
+        abbastanza pixel luminosi, più il margine anti-blur; 0 (nessuna barra)
+        se nessuna lo è entro la finestra cercata: è una scena scura, non
+        una barra più larga del massimo consentito."""
         trovate = np.flatnonzero(frazioni >= cls.FRAZIONE_MIN)
         if not trovate.size:
-            return cap
+            return 0
         i = int(trovate[0])
         return min(i + cls.MARGINE_PX, cap) if i > 0 else 0
 
@@ -477,7 +481,16 @@ class BlackBarDetector:
 
         luminoso = frame_gray >= soglia
 
-        fr_top    = luminoso[:max_h].mean(axis=1)
+        # Pagina/scena quasi tutta nera: nessun contenuto da cui dedurre una
+        # barra, quindi nessuna barra (le barre si ritirano con TAU_RIMOZIONE).
+        if luminoso.mean() < self.FRAZIONE_FRAME_MIN:
+            self.top    = self._insegui(self.top,    0, dt)
+            self.bottom = self._insegui(self.bottom, 0, dt)
+            self.left   = self._insegui(self.left,   0, dt)
+            self.right  = self._insegui(self.right,  0, dt)
+            return
+
+        fr_top   = luminoso[:max_h].mean(axis=1)
         fr_bottom = np.concatenate([luminoso[h - max_h:, :lato],
                                     luminoso[h - max_h:, w - lato:]],
                                    axis=1).mean(axis=1)[::-1]

@@ -93,8 +93,9 @@ CAPTURE_FPS_CAP = 60
 # Rilevamento dinamico barre nere (letterbox/pillarbox): restringe il
 # campionamento verso il centro del contenuto reale quando rileva barre nere
 # sostenute ai bordi. BLACKBAR_MAX_RATIO limita quanto può "mangiare" per lato
-# (frazione di altezza/larghezza) — oltre quel limite si assume che sia una
-# scena scura, non letterbox, e i LED si spengono normalmente via SOGLIA_MINIMA.
+# (frazione di altezza/larghezza). Se entro quel limite non c'è contenuto, o il
+# frame è quasi tutto nero, si assume una scena scura (non letterbox): nessuna
+# barra, e i LED si spengono normalmente via SOGLIA_MINIMA.
 BLACKBAR_DETECTION  = True
 BLACKBAR_MAX_RATIO  = 0.20
 # Luminanza (0-255) sotto cui un pixel conta come "nero" per le barre. Separata
